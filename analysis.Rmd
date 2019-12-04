@@ -1,0 +1,1515 @@
+---
+title: "A validation of machine learning-based risk scores in the prehospital setting"
+author: 
+  - Douglas Spangler
+  - Thomas Hermansson
+  - David Smekal
+  - Hans Blomberg
+output:
+  word_document: default
+  pdf_document: default
+---
+# Setup
+```{r setup, include=FALSE}
+
+# Remember to set your working directory to the location of this file or relative file paths won't work!
+
+# if using Rstudio, this ought to do it:
+if(rstudioapi::isAvailable()){
+  setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+}
+
+# Set config variables
+
+inclset = "main" # "S6" for broadened inclusion criteria
+pubmods = FALSE # TRUE to generate public release models and include them in the validation
+
+# Don't print source code when knitting document, and don't print warnings/messages
+knitr::opts_chunk$set(echo = F,
+                      warning = F,
+                      error = F,
+                      message = F,
+                      cache = F,
+                      fig.width = 8,
+                      fig.height = 5)
+
+# Don't use scientific notation
+options(scipen = 999)
+
+# Load necessary package (installing them if necessary)
+
+pkglist <- c("tidyverse", # For general data munging and plotting
+             "lubridate", # For handling dates/times
+             "boot", # For doing bootstrap calculations
+             "knitr", # For generating pretty tables
+             "xgboost", # For fitting and cross validation of gradient boosting models
+             "PRROC", # for generating precisicion/recall and reciever operating characteristincs curves
+             "pROC", # For getting CIs for sensitivity/specificity values (can't do PRCs though)
+             "geosphere", # For calculating distances between coordinates on a geoid
+             "rms", # For testing model calibration 
+             "mice", # For doing multiple imputation
+             "EnvStats", # For truncated distributions
+             "micemd", # For parallelizing multiple imputations
+             "flextable", # For making pretty tables
+             "officer") # needed to define border properties
+
+newpkg <- pkglist[!(pkglist %in% installed.packages()[,"Package"])]
+if(length(newpkg)) install.packages(newpkg)
+
+lapply(pkglist, require, character.only = TRUE)
+
+# Set random seed for reproducibility
+seed <- 42
+
+set.seed(seed)
+
+# Load additional functions used in the analysis
+
+source("functions.R")
+
+```
+# Load
+```{r load data}
+
+## This section loads the study data if it exists. Otherwise, some fake data will be loaded.
+
+## PLEASE NOTE!!! Using fake data, all results will be garbage. This is really only so that you can check that the code runs correcly in your environment, and to give you a sense of what the data should look like. The data properties file also provides some more detailed descriptive statistics regarding the distribution of the variables in our data. Bon appetit!
+
+data_file = "data/studydata.rda"
+
+if(file.exists(data_file)){
+  
+  # Load source data
+  load(data_file)
+  fakedata <- 0
+  
+  # Rename some variables for easier implementation of demo
+  
+  studydata <- studydata %>%
+    rename(amb_int_pin = amb_pin,
+           amb_int_iv = amb_iv,
+           amb_int_immob = amb_immob,
+           amb_int_cpr = amb_cpr,
+           amb_int_o2 = amb_o2,
+           amb_int_ekg = amb_ekg,
+           amb_int_alert = amb_alert,
+           amb_time_disp = amb_disptime,
+           amb_time_scene = amb_scenetime,
+           amb_time_toed = amb_timetoed) %>%
+    dplyr::select(-contains("_init_")) %>%
+    mutate(hosp_critcare = ifelse(hosp_icu | (hosp_deadinhosp & hosp_deaddays <= 30),
+                                        1,0))
+  
+  
+  
+  # Encoding issues are so painful to deal with...
+  
+  names(studydata) <- gsub("ä","a",names(studydata))
+  names(studydata) <- gsub("å","a",names(studydata))
+  names(studydata) <- gsub("ö","o",names(studydata))
+  
+  names(studydata) <- gsub("Ä","A",names(studydata))
+  names(studydata) <- gsub("Å","A",names(studydata))
+  names(studydata) <- gsub("Ö","O",names(studydata))
+  
+  names(studydata) <- gsub("é","e",names(studydata))
+  
+  ## Extract some univariate properties of our data that we'll use to generate fake data when there is no data file to load
+  
+  ## TODO: Might try generating synthetic data with appropriate multivariate distributions if it turns out that there are people out there who whould find such a thing useful. Takes some consideration to get it right though.
+  
+  if(!file.exists("data/data_properties.rda")){
+    # Get names of all reported variables
+    synthnames <- sapply(names(studydata),
+                         function(x,n){
+                           grepl(paste(n, collapse = "|^"),x)
+                         },n = names(prettyNames))
+    
+    synthnames <- synthnames[synthnames == T]
+    
+    synthdata <- studydata[,names(studydata) %in% names(synthnames)] %>%
+      select_if(function(x){is.numeric(x)}) %>% ## Filter out non-numeric variables (text fields)
+      dplyr::select(-starts_with("disp_q"))     ## Dispatch CDSS structure is proprietary, sorry. :(
+      
+    data_properties <- do.call(rbind,sapply(synthdata,summary))
+    data_properties <- data.frame(data_properties,
+                        sd = sapply(synthdata, sd, na.rm = T),
+                        n_unique = sapply(synthdata,function(x) length(unique(x))),
+                        n_decimals = sapply(synthdata,function(x){
+                          p <- strsplit(as.character(x),"\\.")[[1]][2]
+                          out <- ifelse(is.na(p),0,max(nchar(p)))
+                          return(out)
+                        }))
+    
+    vals = sapply(synthdata,function(x){
+                          # If there are fewer than 20 unique values, generate a freqency table
+                          ifelse(length(unique(x)) < 20, 
+                                 list(table(x, useNA = "ifany")),
+                                 integer(0))
+    })
+    
+    ## This is kinda interesting, so write a .csv file to disk for the poor folks who don't know R
+    write.csv(data_properties, file = "data/data_properties.csv")
+    
+    ## csvs have a hard time with nested lists though
+    data_properties$vals <- vals
+    
+    save(data_properties, file = "data/data_properties.rda")
+    
+  }
+}else{
+  
+  # If no data file present, generate some fake data with reasonable univariate properties.
+  study_n = 68668
+  
+  load("data/data_properties.rda")
+  
+  # generate some fake data with approximately correct univariate distributions. We assume a normal distribution for variables with more than 20 unique values.
+  
+  studydata <- as.data.frame(apply(data_properties, 1, generate_synthdata, n = study_n)) %>%
+  mutate_at(vars(starts_with("hosp_")),funs(ifelse(hospj == 0,NA,ifelse(is.na(.),0,.)))) # Need to make sure there are no missing outcome observations
+  
+  # Handle call timestamps (the only non-numeric variable we need in this analysis) seperately
+  studydata$CreatedOn <- as.POSIXct(runif(study_n,
+                                        as.numeric(ymd_hms("2016-01-01 00:00:00")),
+                                        as.numeric(ymd_hms("2018-12-31 23:59:59"))),
+                                  origin = "1970-01-01")
+  
+  studydata$caseid <- seq_along(1:nrow(studydata))
+  
+      # The xgboost algorithm fits a trivial constant model for two-day mortality resulting in an error when generating the variable importance data... We fix this in a quick and dirty way by adding some correlations for the model to find - let's make people who get critical care die within 2 days have a higher reccommended priority.
+  
+  studydata$disp_recpout <- ifelse(studydata$hosp_dead2day == 1 | studydata$hosp_critcare == 1,
+                               pmin(studydata$disp_recpout + 1,max(studydata$disp_recpout)), 
+                               studydata$disp_recpout)
+  
+  fakedata <- 1
+  
+  print("Synthetic data used! Note that all results here are essentially random.")
+  
+}
+
+```
+# Transformations
+```{r data transformations}
+
+# In this section, we present the data transformations we performed in terms of feature engineering. Note that we do not include simple data cleaning measures to exctract this dataset from our quality improvement database, as the database structure is ideosyncratic
+
+## Calculate full NEWS scores
+
+# Count number of missing vitals for each patient (assume AVPU and CGS are interchangeable), and calculate news scores for complete cases
+
+studydata <- rowwise(studydata) %>%
+  mutate(nmissvitals = sum(is.na(amb_v_br),
+                           is.na(amb_v_spo2),
+                           is.na(amb_v_pr),
+                           is.na(amb_v_bp),
+                           is.na(amb_v_temp),
+                           is.na(amb_v_avpu))) %>%
+  ungroup() %>%
+  mutate(amb_v_avpu = ifelse(is.na(amb_v_avpu) & 
+                               amb_v_gcs == 15,4,
+                             amb_v_avpu),
+         amb_v_gcs = ifelse(is.na(amb_v_gcs) & 
+                               amb_v_avpu == 4,15,
+                             amb_v_gcs)) %>% # IF AVPU is missing, if GCS = 15 set AVPU to 4. The literature is not unanimous with regards to other mappings betwen GCS and AVPU scores, and we'll handle the remainder of missing AVPU values using multiple imputation.
+  news_calc()
+
+# Calculate distance to EDs as the crow flies
+
+hosp_coords <- list("AS" = c(17.641717, 59.848786), # Uppsala University Hospital
+                    "EN" = c(17.069024, 59.629161)) # Enköping Hospital
+
+dists <- lapply(hosp_coords,function(x,d){
+  distm(x, cbind(d$coord_e, d$coord_n), fun = distHaversine)
+},d = studydata)
+
+# Get minimum distance in kilometers
+
+dists <- mapply(min,dists[[1]],dists[[2]])/1000 
+
+studydata$disp_disttoed <- dists
+
+# 30-day cutoff to in-hospital mortality for critical care added in review
+
+studydata$hosp_critcare <- ifelse(studydata$hosp_icu == 1 | ( studydata$hosp_deadinhosp & studydata$hosp_deaddays < 30),1,0)
+
+# Calculate inclusion criteria
+
+if(inclset == "main"){
+  
+studydata <- studydata %>%
+  mutate(incl_disp = !is.na(disp_cat_Feber), # Checking any random category here is fine in our case
+         incl_pin = pin == 1,
+         incl_ambj = ambj > 0 & !is.na(ambj), # Allow multiple ambulance responses
+         incl_ambtxp = (amb_txp == 1 & !is.na(amb_txp)),
+         incl_hospj = hospj == 1 & !is.na(hospj), # Require only a single hospital journal
+         incl_ed = hosp_ed == 1 & !is.na(hosp_ed),
+         incl_vitals = nmissvitals < 3 & !is.na(amb_any),
+         incl_adult = disp_age >= 18 & !is.na(disp_age)) %>%
+  mutate_at(vars(starts_with("incl_")),as.numeric) %>%
+  mutate(inclGroup = apply(dplyr::select(.,starts_with("incl_")),1,function(x) sum(cummin(x))),
+         incl_final = ifelse(rowSums(dplyr::select(.,starts_with("incl_"))) ==
+                               ncol(dplyr::select(.,starts_with("incl_"))),
+                             1,0))
+}
+
+if(inclset == "S6"){
+  
+  studydata <- studydata %>%
+  mutate(incl_disp = !is.na(disp_cat_Feber), # Checking any random category here is fine in our case
+         incl_pin = pin == 1,
+         incl_ambj = ambj > 0 & !is.na(ambj), # Allow multiple ambulance responses
+         incl_hospnontxp = (hospj == 1 & !is.na(hospj)) | (amb_txp == 0 & pin == 1), # Require a single hospital journal or a non-transported patient with a valid pin
+         incl_vitals = nmissvitals < 3 & !is.na(amb_any),
+         incl_adult = disp_age >= 18 & !is.na(disp_age)) %>%
+  mutate_at(vars(starts_with("incl_")),as.numeric) %>%
+  mutate(inclGroup = apply(dplyr::select(.,starts_with("incl_")),1,function(x) sum(cummin(x))),
+         incl_final = ifelse(rowSums(dplyr::select(.,starts_with("incl_"))) ==
+                               ncol(dplyr::select(.,starts_with("incl_"))),
+                             1,0))
+  
+  # Replace NAs in hospital outcomes with zeroes for patients with valid pin
+  studydata$hosp_admit <- ifelse(studydata$incl_pin == 1 & is.na(studydata$hosp_admit),
+                                 0,studydata$hosp_admit)
+  
+  studydata$hosp_critcare <- ifelse(studydata$incl_pin == 1 & is.na(studydata$hosp_critcare),
+                                 0,studydata$hosp_critcare)
+  
+  studydata$hosp_dead2day <- ifelse(studydata$incl_pin == 1 & is.na(studydata$hosp_dead2day),
+                                 0,studydata$hosp_dead2day)
+  
+  print("This sensitivity analysis presents results based on a broader cohort of patients than that presented in the main analysis. In this analysis, patients transported to non-ED destinations, and patients left on scene by the ambulance are included. Hospital records were captured for patients left on scene if they visited the hospital within 72 hours of contacting the ambulance service. Note that vital signs are more often missing among these patients, making the estimation of NEWS scores more unreliable, and assumptions of at-random missingness are thus more tenuous. This cohort of patients is also subject to additional sources of loss to follow-up (e.g. due to the use of healthcare facilities outside of the studied region, and due to contacts outside of the 72 hour window for which we receive hospital data).")
+  
+}
+
+incldata <- filter(studydata,incl_final == 1)
+```
+
+# Imputation
+
+```{r mi}
+# multiple imputation
+
+impdata <- incldata %>%
+  dplyr::select(starts_with("disp_"),
+         starts_with("amb_"),
+         -starts_with("disp_q"),
+         -starts_with("amb_t_"))
+
+cs <- colSums(impdata,na.rm = T)
+
+impdata <- impdata[,which(cs > 100)]
+
+mipath = paste0("data/mi_",inclset,".rda")
+
+if(fakedata == 0){
+  # If using a real dataset...
+    if(!file.exists(mipath)){
+    # Perform multiple imputation if not previously done (This takes a while)
+    
+    mi <- mice.par(impdata,maxit = 20, defaultMethod = "pmm", seed = 42)
+    save(mi,file = mipath)
+    }
+    load(mipath)
+
+
+  # Check convergence
+  #plot(mi,layout = c(2,7))
+  
+  # Check densities
+  #densityplot(mi)
+  
+  implist <- complete(mi,action = "all")
+  
+  implist <- lapply(implist,news_calc)
+  newsimp <- implist[[1]]$news_full
+  
+  for(i in 2:length(implist)){
+    newsimp <- cbind(newsimp,implist[[i]]$news_full)
+  }
+    
+  # Check that imputations all have smilar predictive values for NEWS scores
+  
+  # preds <- as.data.frame(newsimp)
+  # 
+  # labs <- data.frame(hosp_dead2day = incldata$hosp_dead2day,
+  #                    hosp_critcare =  incldata$hosp_critcare,
+  #                    hosp_admit = incldata$hosp_admit)
+  # 
+  # curves = data.frame("label" = character(0),
+  #                     "predictor" = character(0),
+  #                     "y" = integer(0),           
+  #                     "x" = integer(0),
+  #                     "threshold" = integer(0),
+  #                     "type" = character(0))
+  # 
+  # for(i in 1:ncol(labs)){
+  #   roc <- generate_rocdata(preds,labs[,i])
+  #   roc <- cbind("label" = colnames(labs)[i],roc,stringsAsFactors = F)
+  #   curves <- rbind(curves,roc)
+  # }
+  # 
+  #   p <- curves %>%
+  #     ggplot(aes(x=x,y=y,color=predictor)) + 
+  #     geom_line(size = 1) +
+  #     scale_x_continuous(breaks = seq(0,1,0.2)) +
+  #     scale_y_continuous(breaks = seq(0,1,0.2)) +
+  #     labs(x = "1-Specificity (FPR)", y = "Sensitivity") + 
+  #     facet_wrap(~ label) + 
+  #     theme(legend.position="bottom")
+  #   
+  #   p
+  
+  incldata$news <- apply(newsimp,1,median)
+  
+  newsimp <- as.data.frame(newsimp)
+  names(newsimp) <- paste0("mi_news_",seq(1,5,1))
+  
+  timp <- as.mira(as.list(as.data.frame(newsimp)))
+  
+  incldata <- cbind(incldata,newsimp)
+  
+}else{
+  
+  # Otherwise no point wasting time - just generate some random NEWS scores... a lognormal distribution is pretty close, though NEWS scores a bit zero-inflated.
+  
+  # https://msalganik.wordpress.com/2017/01/21/making-sense-of-the-rlnorm-function-in-r/ was helpful here
+  
+  # Known parameters of NEWS scores in our data
+  m <- 3.3
+  stdv <- 3.4
+  
+  # Parameterize
+  loc <- log(m^2 / sqrt(stdv^2 + m^2))
+  spread <- sqrt(log(1 + (stdv^2 / m^2)))
+  
+  incldata$news <- floor(rlnormTrunc(nrow(incldata),loc,spread,min = 0,max = 21))
+}
+
+testdata <- filter(incldata,year(CreatedOn) >= 2018)
+traindata <- filter(incldata,year(CreatedOn) < 2018)
+
+```
+# xgb data
+```{r xgb data}
+
+# Generate datasets to feed to XGB models in a sparse matrix format
+
+xgb_data_disp <- traindata %>%
+  dplyr::select(starts_with("disp_")) %>%
+  as.matrix() %>%
+  Matrix::Matrix(sparse = TRUE)
+
+xgb_data_amb <- traindata %>%
+  dplyr::select(starts_with("disp_"),
+       starts_with("amb_")) %>%
+  # Remove some variables which would not be available in using these models on the ambulance
+  {if(inclset == "S6") select(.,
+                              -amb_time_toed,
+                              -amb_time_scene) else .} %>% 
+  as.matrix() %>%
+  Matrix::Matrix(sparse = TRUE)
+
+xgb_data_pub <- traindata %>%
+  # Exclude CDSS data from public release models
+  dplyr::select(disp_age,
+                disp_gender,
+                disp_hour,
+                disp_month,
+                starts_with("disp_cat_"),
+                starts_with("amb_")) %>%
+  # Don't include number of each medication given for ease of interactive data entry
+  mutate_at(vars(starts_with("amb_meds_")),function(x)ifelse(x>0,1,x)) %>%
+  as.matrix() %>%
+  Matrix::Matrix(sparse = TRUE)
+
+xgb_data_disp_test <- testdata %>%
+  dplyr::select(starts_with("disp_")) %>%
+  as.matrix() %>%
+  Matrix::Matrix(sparse = TRUE)
+
+xgb_data_amb_test <- testdata %>%
+  dplyr::select(starts_with("disp_"),
+       starts_with("amb_")) %>%
+  {if(inclset == "S6") select(.,
+                              -amb_time_toed,
+                              -amb_time_scene) else .} %>% 
+  as.matrix() %>%
+  Matrix::Matrix(sparse = TRUE)
+
+xgb_data_pub_test <- testdata %>%
+  dplyr::select(disp_age,
+                disp_gender,
+                disp_hour,
+                disp_month,
+                starts_with("disp_cat_"),
+                starts_with("amb_"),
+                ) %>%
+  mutate_at(vars(starts_with("amb_meds_")),function(x)ifelse(x>0,1,x)) %>%
+  as.matrix() %>%
+  Matrix::Matrix(sparse = TRUE)
+
+# Generate lists of labels and datasets to use in the analysis (Update these if you're looking to re-use this code)
+
+lablist <- list("hosp_admit" = traindata$hosp_admit,
+                "hosp_critcare" = traindata$hosp_critcare,
+                "hosp_dead2day" = traindata$hosp_dead2day)
+
+datlist <- list("disp" = xgb_data_disp,
+                "amb" = xgb_data_amb,
+                "pub" = xgb_data_pub)
+
+lablist_test <- list("hosp_admit" = testdata$hosp_admit,
+                "hosp_critcare" = testdata$hosp_critcare,
+                "hosp_dead2day" = testdata$hosp_dead2day)
+
+datlist_test <- list("disp" = xgb_data_disp_test,
+                "amb" = xgb_data_amb_test,
+                "pub" = xgb_data_pub)
+
+```
+# xgb models
+```{r xgb models}
+
+# Only run this if there is no model already trained
+
+xgbpath <- paste0("data/xgb_",inclset,".rda")
+xgbcvpath <- paste0("data/xgb_cv_",inclset,".rda")
+
+if(!file.exists(xgbpath)|!file.exists(xgbcvpath)){
+  
+  # Perform grid search to select model hyperparameters. 
+  
+  # Note that we used the same hyperparameters for all reported models, as we found that this set of values worked well across all outcomes and datasets. Here, only the final selected hyperparameters are entered, and an appropriate number of rounds/trees is selected. If re-using this code, add additional values to test in the searchGrid object below, which defines the variables to include in the grid search.
+  
+  searchGrid <- expand.grid(label = names(lablist),
+                            data = names(datlist),
+                            subsample = c(0.7), 
+                            colsample_bytree = c(0.6),
+                            max_depth = c(6),
+                            min_child = c(2), 
+                            eta = c(0.05),
+                            gamma = c(5),
+                            eval.metric = "auc",
+                            objective = "binary:logistic",
+                            stringsAsFactors = F)
+  
+  if(!file.exists("data/best_tune.rda")){
+    # Only perform grid search if no set of best hyperparameters already exists
+    
+    best_tune <- top_gridsearch(lablist,datlist,searchGrid,1)
+    
+    # Early stopping rounds = 10
+    best_tune$nrounds <- best_tune$nrounds - 10
+    save(best_tune, file = "data/best_tune.rda")
+  }
+  load("data/best_tune.rda")
+  # Train final models using best hyperparameters
+   
+  xgb <- xgb_trainmodels(label_train = lablist,
+                        data_train = datlist,
+                        params = best_tune)
+  
+  # xgb_pub <- xgb_trainmodels(label_train = lablist_pub,
+  #                       data_train = datlist_pub,
+  #                       params = best_tune)
+  
+  xgb_cv <- cv_xgb_trainmodels(label_train = lablist,
+                        data_train = datlist,
+                        params = best_tune)
+  
+  # Save these final models to disk
+  save(xgb_cv,file = xgbcvpath)
+  save(xgb,file = xgbpath)
+  # save(xgb_pub,file = "data/xgb_pub.rda")
+}
+
+load(xgbcvpath)
+load(xgbpath)
+
+# Set composite risk score weights
+weights = c(1,1,1)
+
+# generate composite risk scores based on cross-validated predictions. You'll need to update the names of the outcomes here if re-using this code... Should generate these automatically based on lablist really, but life is short!
+
+disp_cv_preds <- data.frame("hosp_admit" = xgb_cv$disp_hosp_admit$pred,
+                       "hosp_critcare" = xgb_cv$disp_hosp_critcare$pred,
+                       "hosp_dead2day" = xgb_cv$disp_hosp_dead2day$pred)
+
+amb_cv_preds <- data.frame("hosp_admit" = xgb_cv$amb_hosp_admit$pred,
+                      "hosp_critcare" = xgb_cv$amb_hosp_critcare$pred,
+                      "hosp_dead2day" = xgb_cv$amb_hosp_dead2day$pred)
+
+pub_cv_preds <- data.frame("hosp_admit" = xgb_cv$pub_hosp_admit$pred,
+                      "hosp_critcare" = xgb_cv$pub_hosp_critcare$pred,
+                      "hosp_dead2day" = xgb_cv$pub_hosp_dead2day$pred)
+
+disp_composite_preds <- generate_composite(disp_cv_preds,
+                                          weights,log_trans = T)
+
+amb_composite_preds <- generate_composite(amb_cv_preds,
+                                          weights,log_trans = T)
+
+pub_composite_preds <- generate_composite(pub_cv_preds,
+                                          weights,log_trans = T)
+
+# Predict risk scores in test data. 
+
+disp_test_preds <- data.frame("hosp_admit" = predict(xgb$disp_hosp_admit,
+                                                     newdata = xgb_data_disp_test),
+                         "hosp_critcare" = predict(xgb$disp_hosp_critcare,
+                                                   newdata = xgb_data_disp_test),
+                         "hosp_dead2day" = predict(xgb$disp_hosp_dead2day,
+                                                   newdata = xgb_data_disp_test))
+
+amb_test_preds <- data.frame("hosp_admit" = predict(xgb$amb_hosp_admit,
+                                                    newdata = xgb_data_amb_test),
+                        "hosp_critcare" = predict(xgb$amb_hosp_critcare,
+                                                  newdata = xgb_data_amb_test),
+                        "hosp_dead2day" = predict(xgb$amb_hosp_dead2day,
+                                                  newdata = xgb_data_amb_test))
+
+pub_test_preds <- data.frame("hosp_admit" = predict(xgb$pub_hosp_admit,
+                                                    newdata = xgb_data_pub_test),
+                        "hosp_critcare" = predict(xgb$pub_hosp_critcare,
+                                                  newdata = xgb_data_pub_test),
+                        "hosp_dead2day" = predict(xgb$pub_hosp_dead2day,
+                                                  newdata = xgb_data_pub_test))
+
+# Generate composite scores in test data. Note that we pass the CV prediction objects here as they contain the scaling parameters necessary to scale predictions in test data appropriately.
+
+disp_composite_preds_test <- predict_composite(disp_test_preds, 
+                                               disp_composite_preds, 
+                                               weights,
+                                               log_trans = T)
+
+amb_composite_preds_test <- predict_composite(amb_test_preds, 
+                                              amb_composite_preds, 
+                                              weights,
+                                              log_trans = T)
+
+pub_composite_preds_test <- predict_composite(pub_test_preds, 
+                                              pub_composite_preds, 
+                                              weights,
+                                              log_trans = T)
+
+```
+# Validation data
+```{r validation data}
+# Generate predictor and label dataframes to be used in validation. Update the outcomes here if necessary if re-using code
+
+preds <- data.frame(pout = 5-as.numeric(traindata$pout), 
+                    news = traindata$news,
+                    disp_composite = disp_composite_preds,
+                    amb_composite = amb_composite_preds)
+if(pubmods == T){
+  preds <- cbind(preds,
+                 pub_composite = pub_composite_preds)
+}
+
+
+labs <- data.frame(hosp_dead2day = traindata$hosp_dead2day,
+                   hosp_critcare =  traindata$hosp_critcare,
+                   hosp_admit = traindata$hosp_admit)
+
+preds_test <- data.frame(pout = 5-as.numeric(testdata$pout), 
+                         news = testdata$news,
+                         disp_composite = disp_composite_preds_test,
+                         amb_composite = amb_composite_preds_test)
+
+if(pubmods == T){
+  preds_test <- cbind(preds_test,
+                 pub_composite = pub_composite_preds_test)
+}
+
+labs_test <- data.frame(hosp_dead2day = testdata$hosp_dead2day,
+                   hosp_critcare =  testdata$hosp_critcare,
+                   hosp_admit = testdata$hosp_admit)
+
+curves = data.frame("label" = character(0),
+                    "valtype" = character(0),
+                    "predictor" = character(0),
+                    "y" = integer(0),
+                    "x" = integer(0),
+                    "threshold" = integer(0),
+                    "type" = character(0))
+
+# Generate ROC curve data for test and CV validation
+
+for(i in 1:ncol(labs)){
+  roc <- generate_rocdata(preds,labs[,i])
+  roc <- cbind("label" = colnames(labs)[i],
+               "valtype" = "Cross-Validated",
+               roc,
+               stringsAsFactors = F)
+  curves <- rbind(curves,roc)
+}
+
+for(i in 1:ncol(labs)){
+  roc <- generate_rocdata(preds_test,labs_test[,i])
+  roc <- cbind("label" = colnames(labs)[i],
+               "valtype" = "Test",
+               roc,
+               stringsAsFactors = F)
+  curves <- rbind(curves,roc)
+}
+
+longlabs_test <-  as.data.frame(rbind(cbind(lab = "hosp_dead2day", 
+                                       val = testdata$hosp_dead2day),
+                                 cbind(lab = "hosp_critcare",
+                                       val =  testdata$hosp_critcare),
+                                 cbind(lab = "hosp_admit",
+                                       val = testdata$hosp_admit)))
+
+longpreddata_test <- data.frame(longlabs_test, preds_test) %>%
+  filter(!is.na(val))
+
+rocaucs_test <- longpreddata_test %>%
+  group_by(lab) %>%
+  summarise_at(vars(-1),funs(boot_auc(.,val, type = "roc"))) %>%
+  mutate("valtype" = "Test")
+
+longlabs <-  as.data.frame(rbind(cbind(lab = "hosp_dead2day", 
+                                       val = traindata$hosp_dead2day),
+                                 cbind(lab = "hosp_critcare",
+                                       val = traindata$hosp_critcare),
+                                 cbind(lab = "hosp_admit",
+                                       val = traindata$hosp_admit)))
+                           
+longpreddata <- data.frame(longlabs, preds) %>%
+  filter(!is.na(val))
+
+rocaucs <- longpreddata %>%
+  group_by(lab) %>%
+  summarise_at(vars(-1),funs(boot_auc(.,val, type = "roc"))) %>%
+  mutate("valtype" = "Cross-Validated")
+
+## Calculate pooled c-indexes for news scores based on rubin's rules
+
+
+news_roc_train <- pool_vals(select(traindata,
+                                   starts_with("mi_news")),
+                            labs)[c(3,2,1)]
+
+news_roc_test <- pool_vals(select(testdata,
+                                  starts_with("mi_news")),
+                           labs_test)[c(3,2,1)]
+
+
+```
+
+# Export public model
+
+```{r pubmodel}
+if(pubmods == T & ! file.exists("demo/pub_mods.rda")){
+  
+  pub_curves <- curves %>%
+    filter(valtype == "Test",
+           predictor == "pub_composite",
+           type == "roc") %>%
+    select(label,x,y,threshold) %>%
+    mutate(threshold = round(threshold,2)) %>%
+    distinct(label,valtype,predictor,threshold,.keep_all = T) %>%
+    rowwise() %>%
+    mutate(tt = list(table(
+                      longpreddata_test$pub_composite[longpreddata_test$lab == label] <= threshold,
+                      1-as.numeric(as.character(longpreddata_test$val[longpreddata_test$lab == label]))))) %>%
+    ungroup()
+  
+  ## Bootstrap?
+  
+  nboot = 10
+
+  bootmods <- list()
+  bootmods_cv <- list()
+  bootscale <- list()
+  
+  g <- interaction(lablist)
+
+  for(i in 1:nboot){
+  
+    bootrows <- unlist(tapply(1:nrow(xgb_data_pub), g, sample, replace = T), use.names = FALSE)
+    
+    bootdat <- list("pub" = xgb_data_pub[bootrows,])
+    bootlabs <- lapply(lablist, function(x)x[bootrows])
+    boot_tune <- filter(best_tune, data == "pub")
+    
+    bootmods[[i]] <- xgb_trainmodels(label_train = bootlabs,
+                               data_train = bootdat,
+                               params = boot_tune)
+    
+    
+    
+    bootmods_cv <- cv_xgb_trainmodels(label_train = bootlabs,
+                               data_train = bootdat,
+                               params = boot_tune)
+    
+    boot_cv_preds <- data.frame("hosp_admit" = bootmods_cv$pub_hosp_admit$pred,
+                      "hosp_critcare" = bootmods_cv$pub_hosp_critcare$pred,
+                      "hosp_dead2day" = bootmods_cv$pub_hosp_dead2day$pred)
+
+    bootscale[[i]] <- generate_composite(boot_cv_preds,
+                                          weights,log_trans = T)
+  }
+
+  medvals <- apply(xgb_data_pub,2,median,na.rm = T) %>% round()
+  
+  mods <- list("hosp_admit" = xgb$pub_hosp_admit,
+                  "hosp_critcare" = xgb$pub_hosp_critcare,
+                  "hosp_dead2day" = xgb$pub_hosp_dead2day)
+  
+  pub_mods <- list("mods" = mods,
+                   "bootmods" = bootmods,
+                   "medvals" = medvals,
+                   "scale" = pub_composite_preds,
+                   "bootscale" = bootscale,
+                   "roc" = pub_curves)
+  
+  save(pub_mods, file = "demo/pub_mods.rda")
+  
+}
+
+```
+
+
+# Sensitivity / specificity data
+```{r senspec}
+
+# Generate confidence intervalled sensitivity and specificity values for presentation in text
+
+# Get NEWS scores at thresholds of interest. Note that since we're using a different package to calculate CIs, we need to specify threshold values which are one less than those we're interested in. 
+
+rules <- curves %>%
+  filter(predictor %in% "news" & 
+           valtype == "Test" &
+           threshold %in% c(0,1,3,6) &
+           y != 1 &
+           y != 0) %>%
+  mutate(threshold = threshold + 1,
+         rulethresh = threshold)
+
+
+mods <- apply(rules,1,function(r,c){
+  out <- c %>%
+    filter(predictor %in% c("amb_composite","disp_composite"),
+           label == r["label"],
+           valtype == "Test") %>%
+    group_by(label,predictor) %>% 
+    filter(y >= r["y"]) %>%
+    mutate(x = 1-x,
+           rulethresh = r["rulethresh"]) %>%
+    top_n(n=1,wt=threshold) %>%
+    ungroup()
+  return(out)
+}, c = curves)
+
+mods <- do.call(rbind,mods)
+
+citab <-rbind(rules,mods)
+
+senspec <- apply(citab,1,function(x,p_apply,l_apply,mods = c("disp_composite","amb_composite")){
+  p = p_apply[,x["predictor"]]
+  l = l_apply[,x["label"]]
+  r = roc(l,p)
+  ci = ci.thresholds(r, threshold = as.numeric(x["threshold"]), boot.n = 200)
+  x = c(x,"sens_ci" = paste0(format(round(ci$sensitivity[2],2), nsmall = 2)," (",
+                            format(round(ci$sensitivity[1],2), nsmall = 2)," - ",
+                            format(round(ci$sensitivity[3],2), nsmall = 2),")"),
+        "spec_ci" = paste0(format(round(ci$specificity[2],2), nsmall = 2)," (",
+                          format(round(ci$specificity[1],2), nsmall = 2)," - ",
+                          format(round(ci$specificity[3],2), nsmall = 2),")"))
+  return(x)
+},p_apply = preds_test,l_apply = labs_test)
+
+
+senspec <- as.data.frame(t(senspec),stringsAsFactors = F) %>%
+  arrange(label)
+```
+# Variable importance
+```{r varimp}
+
+  admitimp <- cbind(xgb.importance(model = xgb$amb_hosp_admit),model = "hosp_admit")
+critcareimp <- cbind(xgb.importance(model = xgb$amb_hosp_critcare),model = "hosp_critcare")
+dead2dayimp <- cbind(xgb.importance(model = xgb$amb_hosp_dead2day),model = "hosp_dead2day")
+
+xgb_varimp <- full_join(admitimp,critcareimp) %>%
+  full_join(dead2dayimp) %>%
+  dplyr::select(Feature,Gain,model) %>%
+  group_by(Feature) %>%
+  mutate(mean_gain = mean(Gain,na.rm = T)) %>%
+  ungroup() %>%
+  arrange(desc(mean_gain)) %>%
+  mutate(Feature = reorder(Feature,mean_gain)) %>%
+  mutate(model = factor(model, levels = c("hosp_admit",
+                                          "hosp_critcare",
+                                          "hosp_dead2day")))
+
+```
+# Tables and figures
+## Table 1
+```{r table1}
+
+# Generate table 1 based on inclusion criteria calculated above
+
+full_excl <- get_exclusions(studydata)
+train_excl <- get_exclusions(studydata[studydata$test==0,])
+test_excl <- get_exclusions(studydata[studydata$test==1,])
+
+## Calculate some of the totals for table 1 "manually"
+
+table1 <- cbind(train_excl,
+                test_excl[,-1],
+              stringsAsFactors = F)
+
+table1 <- rbind(c("Original","","",nrow(studydata[studydata$test==0,]),"","",nrow(studydata[studydata$test==1,]),""),table1)
+
+table1[table1$var == "incl_final",] <- c("Included in study",
+  nrow(studydata[studydata$test==0,]) - nrow(traindata),
+  round((1-(nrow(traindata)/nrow(studydata[studydata$test==0,])))*100,1),
+  nrow(traindata),
+  nrow(studydata[studydata$test==1,]) - nrow(testdata),
+  round((1-(nrow(testdata)/nrow(studydata[studydata$test==1,])))*100,1),
+  nrow(testdata))
+
+# Avoid duplicate names
+t1names <- get_names(names(table1))
+names(table1) <- c(names(table1)[1],
+                   paste0(names(table1)[2:4],"_train"),
+                   paste0(names(table1)[5:7],"_test"))
+
+table1_final <- flextable(get_names(table1), cwidth = 0.75) %>%
+  set_header_df(mapping = data.frame(keys = names(table1), 
+                                             values = t1names, 
+                                             stringsAsFactors = FALSE),
+              key = "keys" ) %>%
+  add_header_row(values = c("","Training dataset (2016-2017)","Test dataset (2018)"), 
+                 colwidths = c(1,3,3)) %>%
+  hline(i = 1, border = fp_border()) %>%
+  hline(i = nrow(table1)-1, border = fp_border()) %>%
+  vline(j = 4, border = fp_border()) %>%
+  align(part = "header", align = "center")
+  
+table1_final
+```
+## Table 2
+```{r table2}
+
+by_prio <- incldata %>%
+  group_by(pout)%>%
+  desc_table() %>%
+  t()
+
+tot <- incldata %>%
+  desc_table() %>%
+  t()
+
+table2 <- cbind(rownames(by_prio),by_prio,c("Total",tot))
+
+colnames(table2) <- c(" ","1A","1B","2A","2B","Total")
+table2 <- as.data.frame(table2[-1,],stringsAsFactors = F)
+
+table2_final <- get_names(table2) %>%
+flextable() %>%
+  add_header_row(values = c("","Priority",""), 
+                 colwidths = c(1,4,1)) %>%
+  align(part = "header", align = "center")
+
+table2_final
+
+```
+## Figure 1
+``` {r fig1}
+
+# Generate ROC graphs
+
+fig1 <- get_names(curves) %>%
+  mutate(predictor = factor(predictor, levels = c("Ambulance risk score", 
+                                                  "Dispatch risk score",
+                                                  "Public risk score",
+                                                  "NEWS Score",
+                                                  "Dispatched priority")),
+         label = factor(label, levels = c("Hospital admission",
+                                          "Critical Care",
+                                          "Two-day mortality"))) %>%
+  ggplot(aes(x=x,y=y,color = predictor,linetype = `Validation method`)) + 
+  geom_abline(intercept = 0, slope = 1) +
+  geom_line(size = 1) +
+  scale_x_continuous(breaks = seq(0,1,0.2)) +
+  geom_hline(yintercept = 0.95, linetype = 2) +
+  scale_y_continuous(breaks = seq(0,1,0.2)) +
+  labs(x = "1-Specificity (FPR)", y = "Sensitivity",
+       linetype = "Validation method",
+       color = "Predictor") + 
+  facet_wrap(~ label) + 
+  scale_linetype_manual(values=c("dashed","solid")) +
+  theme_minimal() +
+  theme(legend.position="bottom",
+        rect = element_rect(fill = "transparent")) +
+  guides(colour = guide_legend(nrow = 2, byrow = T),
+         linetype = guide_legend(nrow = 2, byrow = T))
+
+fig1
+```
+
+## Table 3
+
+```{r table3}
+
+table3 <- rocaucs_test %>%
+  bind_rows(rocaucs) %>%
+  dplyr::select(valtype,everything()) %>%
+  arrange(rev(valtype),lab)
+
+# Replace median imputed values with estimates pooled using rubin's rules; they are essentially identical due to a near-zero between-imputation variance... But these values are more methodologically correct! :)
+
+table3$news <- c(news_roc_test,news_roc_train)
+
+table3_final <- flextable(get_names(table3)) %>%
+  add_header_row(values = c("","Concordance index (95% CI)"), 
+                 colwidths = c(2,ncol(table3)-2)) %>%
+  merge_v("Validation method") %>%
+  align(part = "header", align = "center") %>%
+  align(j = "Validation method", align = "center") %>%
+  hline(i = 3, border = fp_border()) %>%
+  fix_border_issues()
+
+table3_final
+```
+
+## Table 4
+
+```{r table4}
+prioprev <- table(testdata$pout)
+
+grp <- cbind(select(testdata,caseid,pout),
+             "disp_pred" = disp_composite_preds_test) %>%
+  arrange(desc(disp_pred)) %>%
+  bind_cols(pred_group = rep(as.numeric(names(prioprev)),
+                             prioprev))
+
+descgroups <- left_join(grp,select(testdata,-pout),by="caseid")
+
+
+by_prio <- descgroups %>%
+  group_by(pout)%>%
+  desc_table() %>%
+  t()
+
+by_pred <- descgroups %>%
+  group_by(pred_group)%>%
+  desc_table() %>%
+  t()
+
+table4 <- cbind(rownames(by_prio),by_prio,by_pred) %>%
+  t()
+
+table4 <- as.data.frame(table4[-1,c(2,3,5,6,8,12,13,14)],
+                        stringsAsFactors = F) %>%
+  bind_cols("Type" = c(rep("Current",4),
+                       rep("By dispatch risk score",4)),
+            "Priority" = c("1A","1B","2A","2B",
+                  "1A","1B","2A","2B"),.)
+
+table4_final <- get_names(table4) %>%
+flextable() %>%
+  merge_v("Type")
+
+table4_final
+```
+
+## Figure 2
+```{r fig2, fig.height=4}
+
+  fig2 <- get_names(head(xgb_varimp,3*15)) %>%
+          ggplot(aes(x = Gain,y = Feature, color = model)) +
+          geom_point(shape = 18, size = 4) + 
+          labs(x = "Proportional gain in accuracy from including variable", 
+               y = "Variable") +
+          theme_minimal() +
+          theme(legend.position="bottom")
+
+fig2
+
+```
+
+
+# Supplementary analyses
+
+## S1 Table - Predictor description
+
+```{r predictors}
+
+#For the sake of brevity, we aggregate individual dummy variables to the categorical variable they are drawn from in this table.
+
+vargroups <- c("meds",
+  "airway",
+  "breathing", 
+  "circ", 
+  "pulse", 
+  "skincond", 
+  "breathsounds", 
+  "ptmeds", 
+  "medhist",
+  "cat",
+  "calltypes",
+  "q")
+
+nmods = length(unique(xgb_varimp$model))
+
+varimp_sums <- xgb_varimp %>%
+  separate(Feature,into = c("source","group","var","answer") ,"_") %>%
+  mutate(var_ans = paste(var,answer),
+         var = ifelse(group %in% vargroups,NA,var),
+         feature = gsub("_NA","",paste(source,group,var,sep = "_")),
+         value = ifelse(is.na(Gain),0,Gain)) %>%
+  group_by(feature) %>%
+  dplyr::summarize(sum_gain = sum(Gain)/nmods*100,
+                   n_vars = length(unique(var_ans))) %>%
+  ungroup()
+
+vardesc <- incldata %>%
+  dplyr::select(starts_with("disp_"),
+         starts_with("amb_")) %>%
+  select_if(is.numeric) %>%
+  mutate_all(funs(ifelse(. == 0 | is.na(.) ,0,1)))
+
+feats <- data.frame(feature = colnames(vardesc)) %>%
+  separate(feature,into = c("source","group","var","Answer") ,"_") %>%
+  mutate(var = ifelse(group %in% vargroups,NA,var),
+         feature = gsub("_NA","",paste(source,group,var,sep = "_")))
+  
+vardesc2 <- as.data.frame(t(vardesc),
+                         stringsAsFactors = F) %>%
+  mutate(feature = feats$feature) %>%
+  group_by(feature) %>%
+  summarise_all(funs(max)) %>%
+  t() %>%
+  as.data.frame(stringsAsFactors = F)
+
+names(vardesc2) <- vardesc2[1,]
+vardesc3 <- vardesc2[-1,] %>%
+  mutate_all(as.numeric)
+
+vartab <- data.frame(feature = names(colSums(vardesc3)),
+                     n_value = colSums(ifelse(vardesc3 == 0,0,1),
+                                       na.rm = T),
+                     pct_value = round(colMeans(vardesc3)*100,1)) %>%
+   left_join(varimp_sums,by = "feature") %>%
+  filter(!is.na(sum_gain))
+
+s1table_final <- flextable(get_names(vartab)) %>%
+  colformat_num("Percent of included calls with non-zero/non-missing value", digits = 1) %>%
+  colformat_num("Number of included calls with non-zero/non-missing value", digits = 0)
+```
+
+```{r}
+s1table_final
+```
+
+
+## S2 Analysis - Precision/Recall
+
+```{r prc, fig.width=8}
+prcurves = data.frame("label" = character(0),
+                    "predictor" = character(0),
+                    "y" = integer(0),
+                    "x" = integer(0),
+                    "threshold" = integer(0),
+                    "type" = character(0))
+
+for(i in 1:ncol(labs)){
+  pr <- generate_prdata(preds,labs[,i])
+  pr <- cbind("label" = colnames(labs)[i],
+               "valtype" = "Cross-Validated",
+              pr,
+              stringsAsFactors = F)
+  prcurves <- rbind(prcurves,pr)
+}
+
+for(i in 1:ncol(labs)){
+  pr <- generate_prdata(preds_test,labs_test[,i])
+  pr <- cbind("label" = colnames(labs)[i],
+               "valtype" = "Test",
+               pr,
+               stringsAsFactors = F)
+  prcurves <- rbind(prcurves,pr)
+}
+
+
+s2fig <- get_names(prcurves) %>%
+  mutate(predictor = factor(predictor, levels = c("Ambulance risk score", 
+                                                  "Dispatch risk score",
+                                                  "NEWS Score",
+                                                  "Dispatched priority")),
+         label = factor(label, levels = c("Hospital admission",
+                                          "Critical Care",
+                                          "Two-day mortality")))  %>%
+  ggplot(aes(x=x,y=y,color=predictor,linetype = `Validation method`)) + 
+  geom_line(size = 1) +
+  scale_x_continuous(breaks = seq(0,1,0.2)) +
+  scale_y_continuous(breaks = seq(0,1,0.2)) +
+  labs(x = "Recall", y = "Precision",
+       linetype = "Validation method",
+       color = "Predictor") + 
+  facet_wrap(~ label) + 
+  scale_linetype_manual(values=c("dashed","solid")) +
+  theme_minimal() +
+  theme(legend.position="bottom",
+        rect = element_rect(fill = "transparent")) +
+  guides(colour = guide_legend(nrow = 2, byrow = T),
+         linetype = guide_legend(nrow = 2, byrow = T))
+  
+s2fig
+
+praucs_test <- longpreddata_test %>%
+  group_by(lab) %>%
+  summarise_at(vars(-1),funs(boot_auc(.,val, type = "pr"))) %>%
+  mutate("valtype" = "Test")  
+
+praucs <- longpreddata %>%
+  group_by(lab) %>%
+  summarise_at(vars(-1),funs(boot_auc(.,val, type = "pr")))%>%
+  mutate("valtype" = "Cross-Validated")  
+
+s2table <- praucs_test %>%
+  bind_rows(praucs) %>%
+  dplyr::select(valtype,everything()) %>%
+  arrange(rev(valtype),lab)
+
+flextable(get_names(s2table)) %>%
+  add_header_row(values = c("","Area under Precision/Recall curve (95% CI)"), 
+                 colwidths = c(2,ncol(s2table)-2)) %>%
+  merge_v("Validation method") %>%
+  align(j = "Validation method", align = "center") %>%
+  hline(i = 3, border = fp_border()) %>%
+  align(part = "header", align = "center") %>%
+  fix_border_issues()
+
+
+```
+
+## S3 Figure - Model calibration curves
+
+### Overall
+
+```{r calib_overall}
+
+calib_tab <- expand.grid("labs" = rev(unique(names(labs))),
+            "preds" = unique(names(preds)[-1]),
+            stringsAsFactors = F)
+
+calibstats <- data.frame("pred" = character(0),
+                         "lab" = character(0),
+                         "groupvar" = character(0),
+                         "group" = character(0),
+                         "n" = numeric(0),
+                         "E_avg" = numeric(0),
+                         "C_index" = numeric(0),
+                         stringsAsFactors = F)
+
+# Set minimum number of observations per point to be plotted
+
+nmin = 10
+
+par(mfrow=c(3,3),
+    mar=c(2,2,3,2),
+    oma = c(2,2,0,0))
+
+for(i in seq(nrow(calib_tab))){
+  tit <- paste0(get_names(calib_tab$preds[i]),"\n",get_names(calib_tab$labs[i]))
+  dat <- val_prob(preds_test[,calib_tab$preds[i]],
+                   labs_test[,calib_tab$labs[i]],
+                  g = F,
+                  m = nmin)
+  
+  ngrp = nrow(dat$stats)
+  calibstats <- rbind(calibstats,
+                      cbind("pred" = get_names(calib_tab$preds[i]),
+                            "lab" = get_names(calib_tab$labs[i]),
+                            "groupvar" = "Overall",
+                            "group" = "Overall",
+                            "n" = dat$stats[,"n"],
+                            "E_avg" = dat$stats[,"Eavg"],
+                            "C_index" = dat$stats[,"C"]))
+  plt <- val_prob_plot(dat, statloc = F, xlab = " ",ylab = " ", labels = "")
+  title(tit)
+}
+
+mtext('Predicted probability', side = 1, line = 1, outer = TRUE)
+mtext('Actual probability', side = 2, line = 1, outer = TRUE)
+
+```
+
+## Sub-group calibration
+
+### By Age quartiles
+
+```{r calib_age, warning=F}
+
+par(mfrow=c(3,3),
+    mar=c(2,2,3,2),
+    oma = c(2,2,0,0))
+
+groupvar = "Age"
+for(i in seq(nrow(calib_tab))){
+  tit <- paste0(get_names(calib_tab$preds[i]),"\n",get_names(calib_tab$labs[i]))
+  dat <- val_prob(preds_test[,calib_tab$preds[i]],
+                   labs_test[,calib_tab$labs[i]],
+                  g = testdata$disp_age,
+                  m = nmin)
+  ngrp = nrow(dat$stats)
+    calibstats <- rbind(calibstats,
+                        cbind("pred" = rep(get_names(calib_tab$preds[i]),ngrp),
+                              "lab" = rep(get_names(calib_tab$labs[i]),ngrp),
+                              "groupvar" = rep(groupvar,ngrp),
+                              "group" =  names(dat$stats[,"C"]),
+                              "n" = dat$stats[,"n"],
+                              "E_avg" = dat$stats[,"Eavg"],
+                              "C_index" = dat$stats[,"C"]))
+  plt <- val_prob_plot(dat, statloc = F, xlab = " ",ylab = " ", cex = 1)
+  title(tit)
+}
+
+mtext('Predicted probability', side = 1, line = 1, outer = TRUE)
+mtext('Actual probability', side = 2, line = 1, outer = TRUE)
+
+```
+
+### By Gender
+
+```{r calib_gender, warning=F}
+par(mfrow=c(3,3),
+    mar=c(2,2,3,2),
+    oma = c(2,2,0,0))
+
+groupvar = "Gender"
+for(i in seq(nrow(calib_tab))){
+  tit <- paste0(get_names(calib_tab$preds[i]),"\n",get_names(calib_tab$labs[i]))
+  dat <- val_prob(preds_test[,calib_tab$preds[i]],
+                   labs_test[,calib_tab$labs[i]],
+                  g = factor(testdata$disp_gender, labels = c("Male","Female")),
+                  m = nmin)
+  ngrp = nrow(dat$stats)
+    calibstats <- rbind(calibstats,
+                        cbind("pred" = rep(get_names(calib_tab$preds[i]),ngrp),
+                              "lab" = rep(get_names(calib_tab$labs[i]),ngrp),
+                              "groupvar" = rep(groupvar,ngrp),
+                              "group" =  names(dat$stats[,"C"]),
+                              "n" = dat$stats[,"n"],
+                              "E_avg" = dat$stats[,"Eavg"],
+                              "C_index" = dat$stats[,"C"]))
+  plt <- val_prob_plot(dat, statloc = F, xlab = " ",ylab = " ", cex = 1)
+  title(tit)
+}
+
+mtext('Predicted probability', side = 1, line = 1, outer = TRUE)
+mtext('Actual probability', side = 2, line = 1, outer = TRUE)
+
+```
+
+### By Priority
+
+```{r calib_prio, warning=F}
+par(mfrow=c(3,3),
+    mar=c(2,2,3,2),
+    oma = c(2,2,0,0))
+
+groupvar = "Priority"
+for(i in seq(nrow(calib_tab))){
+  tit <- paste0(get_names(calib_tab$preds[i]),"\n",get_names(calib_tab$labs[i]))
+  dat <- val_prob(preds_test[,calib_tab$preds[i]],
+                   labs_test[,calib_tab$labs[i]],
+                  g = factor(testdata$pout, labels = c("2B","2A","1B","1A")),
+                  m = nmin)
+  ngrp = nrow(dat$stats)
+    calibstats <- rbind(calibstats,
+                        cbind("pred" = rep(get_names(calib_tab$preds[i]),ngrp),
+                              "lab" = rep(get_names(calib_tab$labs[i]),ngrp),
+                              "groupvar" = rep(groupvar,ngrp),
+                              "group" =  names(dat$stats[,"C"]),
+                              "n" = dat$stats[,"n"],
+                              "E_avg" = dat$stats[,"Eavg"],
+                              "C_index" = dat$stats[,"C"]))
+  plt <- val_prob_plot(dat, statloc = F, xlab = " ",ylab = " ", cex = 1)
+  title(tit)
+}
+
+mtext('Predicted probability', side = 1, line = 1, outer = TRUE)
+mtext('Actual probability', side = 2, line = 1, outer = TRUE)
+
+```
+
+### By Common call types
+
+```{r calib_ct, warning=F}
+par(mfrow=c(3,3),
+    mar=c(2,2,3,2),
+    oma = c(2,2,0,0))
+
+groupvar = "Calltype"
+
+## Get names of the most comon call types and generate a categorical variable
+
+cts <- sort(colSums(dplyr::select(testdata,starts_with("disp_cat")),na.rm = T), decreasing = T)
+
+cats <- names(cts[1:5])
+
+ct <- ifelse(testdata[cats[1]] == 1,get_names(cats[1]),
+             ifelse(testdata[cats[2]] == 1,get_names(cats[2]),
+             ifelse(testdata[cats[3]] == 1,get_names(cats[3]),
+             ifelse(testdata[cats[4]] == 1,get_names(cats[4]),
+             ifelse(testdata[cats[5]] == 1,get_names(cats[5]),
+             "Other")))))
+
+for(i in seq(nrow(calib_tab))){
+  tit <- paste0(get_names(calib_tab$preds[i]),"\n",get_names(calib_tab$labs[i]))
+  dat <- val_prob(preds_test[,calib_tab$preds[i]],
+                   labs_test[,calib_tab$labs[i]],
+                  g = ct,
+                  m = nmin)
+  ngrp = nrow(dat$stats)
+  calibstats <- rbind(calibstats,
+                      cbind("pred" = rep(get_names(calib_tab$preds[i]),ngrp),
+                            "lab" = rep(get_names(calib_tab$labs[i]),ngrp),
+                            "groupvar" = rep(groupvar,ngrp),
+                            "group" =  names(dat$stats[,"C"]),
+                            "n" = dat$stats[,"n"],
+                            "E_avg" = dat$stats[,"Eavg"],
+                            "C_index" = dat$stats[,"C"]))
+  names(dat$cal.curves) <- gsub("Dispatch - ","",names(dat$cal.curves))
+  plt <- val_prob_plot(dat, statloc = F, xlab = " ",ylab = " ", cex = 1)
+  title(tit)
+}
+
+mtext('Predicted probability', side = 1, line = 1, outer = TRUE)
+mtext('Actual probability', side = 2, line = 1, outer = TRUE)
+```
+
+## S4 Table - Model calibration mean absolute error
+```{r}
+sup3t <- calibstats %>%
+  dplyr::select(pred,lab,n,E_avg,groupvar) %>%
+  group_by(pred,lab,groupvar) %>%
+  dplyr::summarize(E_avg = weighted.mean(as.numeric(as.character(E_avg)),
+                                  as.numeric(as.character(n)))) %>%
+  spread(lab, E_avg) %>%
+  arrange(groupvar) %>%
+  dplyr::select(groupvar,everything()) %>%
+  rename(" " = groupvar,
+         "  " = pred)
+
+
+flextable(sup3t) %>%
+ add_header_row(values = c("Stratification variable","Predictor","Mean absolute error from ideal calibration"),
+                colwidths = c(1,1,3)) %>%
+  merge_v(j = 1) %>%
+  colformat_num(col_keys = c("Hospital admission","Critical Care","Two-day mortality"), digits = 4) %>%
+ align(part = "header", align = "center") %>%
+  fix_border_issues()
+  
+```
+
+## S5 Table - Sensitivity to alternate weights
+
+```{r weights}
+weightlist <- list("100:10:1" = c(100,10,1),
+                   "4:2:1" = c(4,2,1),
+                   "1:1:1" = c(1,1,1),
+                   "1:2:4" = c(1,2,4),
+                   "1:10:100" = c(10,10,100),
+                   "1:0:0" = c(1,0,0),
+                   "0:1:0" = c(0,1,0),
+                   "0:0:1" = c(0,0,1))
+
+predlist <- list("Dispatch" = list("test" = disp_test_preds,
+                                   "CV" = disp_composite_preds),
+                 "Ambulance" = list("test" = amb_test_preds,
+                                    "CV" = amb_composite_preds))
+
+namegrid = expand.grid(names(weightlist),
+                       names(predlist), 
+                       stringsAsFactors = F)
+
+crosslist <- cross2(weightlist,predlist)
+
+t <- lapply(crosslist,function(x){
+  predict_composite(x[[2]][[1]],x[[2]][[2]],x[[1]],use_min = F)
+})
+
+preds_test_weights <- as.data.frame(do.call(cbind,t))
+
+longpreddata_test_weights <- data.frame(longlabs_test, preds_test_weights) %>%
+  filter(!is.na(val))
+
+rocaucs_test_weights <- longpreddata_test_weights %>%
+  group_by(lab) %>%
+  summarise_at(vars(-1),funs(boot_auc(.,val, type = "roc"))) %>%
+  ungroup() %>%
+  t() %>%
+  as.data.frame(stringsAsFactors = F)
+
+names(rocaucs_test_weights) <- rocaucs_test_weights[1,]
+rocaucs_test_weights <- rocaucs_test_weights[-1,]
+rocaucs_test_weights <- cbind("Predictor set" = namegrid$Var2,
+                              "Weights*" = namegrid$Var1,
+                              rocaucs_test_weights,
+                              stringsAsFactors = F)
+
+flextable(get_names(rocaucs_test_weights)) %>%
+  merge_v("Predictor set") %>%
+  align(j = "Predictor set", align = "center") %>%
+  hline(i = 8, border = fp_border()) %>%
+  fix_border_issues()
+```
+* Weights applied to model predictions for Hospital Admission : Critical Care : Two-day Mortality
+
+## S6 Analysis - Broad inclusion criteria
+
+To obtain the results reported in Supplementary analysis 6, set the variable "inclset" to "S6" on row 340. 
+
+## S7 Table - Descriptive statistics by ED diagnosis
+
+```{r triage}
+
+# Only do this if there is actual data (ED triage values are not included as predictors..)
+if(fakedata != 1){ 
+  t <- incldata$hosp_triage
+t2 <- sapply(t,function(x){
+  unname(strsplit(x,"\\|")[[1]][1])
+})
+incldata$hosp_triage_single <- t2
+
+s7table <- incldata %>%
+  group_by(hosp_triage_single) %>%
+  mutate(n = n()) %>%
+  filter(n > 300) %>%
+  desc_table() %>%
+  arrange(desc(N)) %>%
+  select(-"Female, percent", 
+         -"Ambulance intervention*,\n percent",
+         -"Missing vitals,\npercent" , 
+         -"Prior contacts\n(30 days), mean",
+         -"Intensive Care Unit, percent",
+         -"In-hospital death,\npercent")
+
+get_names(s7table) %>%
+flextable()
+}
+
+
+```
+
+
+```{r fig export, eval=F}
+
+# Code to generate hi-res plots for publication
+
+tiff("fig1.tif", res=600, compression = "lzw", height=5, width=8, units="in")
+fig1
+dev.off()
+
+tiff("fig2.tif", res=600, compression = "lzw", height=4, width=8, units="in")
+fig2
+dev.off()
+```
