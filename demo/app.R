@@ -8,7 +8,7 @@ library(epiR)
 library(lubridate)
 
 load("pub_mods.rda")
-source("../functions.R", encoding = "UTF-8")
+source("../functions.R", encoding = "UTF-8")  # For publication to shinyapps, copy functions.R to the demo directory, and remove ../
 
 # Get variable importances for sorting
 
@@ -306,27 +306,34 @@ ui <- shinyUI(
                                   ),
                          tabPanel("About",
                                   tagList(
+                                      h3("A validation of machine learning-based risk scores in the prehospital setting"),
+                                      h4("Douglas Spangler ,Thomas Hermansson, David Smekal, Hans Blomberg"),
+                                      a("doi.org/10.1371/journal.pone.0226518",href="https://doi.org/10.1371/journal.pone.0226518"),
+                                   p(),
+                                   "Source code:",
+                                   a("Github",href="https://github.com/dnspangler/openTriage_validation"),
                                    p(),
                                    "This app demonstrates the behaviour of a risk assessment instrument reflecting a
                                    patient's risk for deterioration at the time of handoff from an ambulance to ED staff based on 
-                                   data available in prehospital care records. The instrument is based on simplified models from 
-                                   an article currently under review, with a preprint available", 
-                                   a("here",href="https://www.medrxiv.org/content/10.1101/19007021v1"),
+                                   data available in prehospital care records.",
                                    p(),
                                    "A patient with median values for each predictor included in the models
                                    is described by default. Modify the model parameters in the sidebar to see how the risk assessment
                                    instrument reacts. If no choice is made for the multiple choice values, a missing/other value is assumed.
                                    Multiple choice options are sorted in order of descending average variable importance across all models.",
                                    p(),
-                                   "The raw score is displayed for the patient at the top of the screen. The Distribution tab displays
-                                   its relative position with respect to the cross-validated scores of the full population. 
+                                   "Click the Predict button to generate a new risk assessment, and the score will be displayed for the patient 
+                                   at the top of the screen. The Distribution tab displays
+                                   the relative position of the patient with respect to the cross-validated scores of the full population. 
                                    Tick this checkbox",div(style = "display: inline-block;width: 10px;height: 10px",checkboxInput("boot","")), 
                                    "to display scores for model predictions based on 10 bootstrap resampled datasets to consider as a measure of model certainty (Experimental feature!)
-                                   The likelihood of each component outcome included in the score displayed underneath. ROC curves associated with 
-                                   each outcome are provided in the Diagnostics tab, along with the position of the current score on the curves for 
+                                   The likelihood of each component outcome included in the score is displayed underneath.",
+                                   p(),
+                                   "ROC curves associated with each outcome are provided in the Diagnostics tab, along with the position of the current score on the curves for 
                                    each outcome. Some 2x2 diagnostics for a decision rule using the risk score of the currently described patient 
                                    as a threshold value is provided beneath the ROC curve. Finally, the Predictors tab provides a table
-                                   reporting the difference in risk score for each variable, if that variable had been set to the median value."),
+                                   reporting the impact of each variable in terms of the difference in risk score between the currently described patient,
+                                   and a patient with the given variable set to the median value in the population."),
                                    p(),
                                    fluidRow(style="text-align: center;padding:60px;",
                                            a(img(src="uu.png", width = "200px"), 
